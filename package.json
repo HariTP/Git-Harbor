@@ -1,0 +1,40 @@
+{
+  "name": "git-storage-gdrive",
+  "version": "0.1.0",
+  "description": "Use a personal Google Drive folder as a Git backup remote.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "bin": {
+    "git-gdrive": "dist/bin/git-gdrive.js",
+    "git-remote-gdrive": "dist/bin/git-remote-gdrive.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.10.1",
+    "eslint": "^10.9.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "google-auth-library": "10.5.0",
+    "googleapis": "^176.0.0",
+    "open": "^11.0.1"
+  }
+}

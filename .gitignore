@@ -1,0 +1,10 @@
+.secrets/
+.opencode/
+.env
+.env.*
+token.json
+credentials.json
+dist/
+node_modules/
+coverage/
+*.tgz
