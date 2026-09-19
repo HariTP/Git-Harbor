@@ -5,6 +5,10 @@ import { delimiter, extname, join } from "node:path";
 import { google } from "googleapis";
 
 import { createAuthSession, type AuthSession } from "../auth/auth-session.js";
+import {
+  AuthenticationRecovery,
+  type AuthenticationPrompt,
+} from "../auth/authentication-recovery.js";
 import { GitStorageError } from "../domain/errors.js";
 import { GitProcess } from "../git/git-process.js";
 import { GitRepositoryEngine } from "../git/git-repository-engine.js";
@@ -13,8 +17,12 @@ import {
   createGoogleDriveExternalClient,
   GoogleDriveRepositoryStore,
 } from "../storage/google-drive-repository-store.js";
-import type { RemoteDescriptor, RepositoryStore } from "../storage/repository-store.js";
-import type { RepositoryMetadata } from "../domain/metadata.js";
+import type {
+  RemoteDescriptor,
+  RepositoryChange,
+  RepositoryStore,
+} from "../storage/repository-store.js";
+import type { ArtifactDescriptor } from "../domain/metadata.js";
 import {
   GitStorageApplication,
   type DoctorCheck,
@@ -29,6 +37,7 @@ export interface GitStorageRuntimeOptions {
   readonly auth?: AuthSession;
   readonly environment?: NodeJS.ProcessEnv;
   readonly currentDirectory?: string;
+  readonly authenticationPrompt?: AuthenticationPrompt;
 }
 
 /** Shared production composition root for both npm executables. */
@@ -38,7 +47,10 @@ export function createGitStorageRuntime(
   const auth = options.auth ?? createAuthSession();
   const environment = options.environment ?? process.env;
   const currentDirectory = options.currentDirectory ?? process.cwd();
-  const store = new LazyRepositoryStore(() => createRepositoryStore(auth, environment));
+  const store = new RecoveringRepositoryStore(
+    () => createRepositoryStore(auth, environment),
+    new AuthenticationRecovery({ authenticator: auth, prompt: options.authenticationPrompt }),
+  );
   const application = new GitStorageApplication({
     store,
     git: new GitRepositoryEngine(),
@@ -48,29 +60,39 @@ export function createGitStorageRuntime(
   return { auth, application };
 }
 
-class LazyRepositoryStore implements RepositoryStore {
+class RecoveringRepositoryStore implements RepositoryStore {
   private storePromise: Promise<RepositoryStore> | undefined;
 
-  constructor(private readonly createStore: () => Promise<RepositoryStore>) {}
+  constructor(
+    private readonly createStore: () => Promise<RepositoryStore>,
+    private readonly authenticationRecovery: AuthenticationRecovery,
+  ) {}
 
   create(displayName: string): Promise<RemoteDescriptor> {
-    return this.store().then((store) => store.create(displayName));
+    return this.execute((store) => store.create(displayName));
   }
 
   readDescriptor(remoteId: string, resourceKey?: string): Promise<RemoteDescriptor> {
-    return this.store().then((store) => store.readDescriptor(remoteId, resourceKey));
+    return this.execute((store) => store.readDescriptor(remoteId, resourceKey));
   }
 
-  downloadBundle(remote: RemoteDescriptor, destination: string): Promise<void> {
-    return this.store().then((store) => store.downloadBundle(remote, destination));
-  }
-
-  publish(
+  downloadArtifact(
     remote: RemoteDescriptor,
-    bundlePath: string | null,
-    nextMetadata: RepositoryMetadata,
-  ): Promise<RemoteDescriptor> {
-    return this.store().then((store) => store.publish(remote, bundlePath, nextMetadata));
+    artifact: ArtifactDescriptor,
+    destination: string,
+  ): Promise<void> {
+    return this.execute((store) => store.downloadArtifact(remote, artifact, destination));
+  }
+
+  publish(remote: RemoteDescriptor, change: RepositoryChange): Promise<RemoteDescriptor> {
+    return this.execute((store) => store.publish(remote, change));
+  }
+
+  private execute<T>(operation: (store: RepositoryStore) => Promise<T>): Promise<T> {
+    return this.authenticationRecovery.run(
+      async () => operation(await this.store()),
+      () => { this.storePromise = undefined; },
+    );
   }
 
   private store(): Promise<RepositoryStore> {

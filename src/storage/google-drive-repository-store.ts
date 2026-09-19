@@ -9,9 +9,10 @@ import { GitStorageError } from "../domain/errors.js";
 import {
   parseRepositoryMetadata,
   serializeRepositoryMetadata,
+  type ArtifactDescriptor,
   type RepositoryMetadata,
 } from "../domain/metadata.js";
-import type { RemoteDescriptor, RepositoryStore } from "./repository-store.js";
+import type { RemoteDescriptor, RepositoryChange, RepositoryStore } from "./repository-store.js";
 
 export interface DriveFile {
   readonly id?: string | null;
@@ -75,7 +76,7 @@ export interface GoogleDriveRepositoryStoreOptions {
 const folderMimeType = "application/vnd.google-apps.folder";
 const jsonMimeType = "application/json";
 const bundleMimeType = "application/octet-stream";
-const formatVersion = "1";
+const formatVersion = "2";
 const driveRoutingValuePattern = /^[A-Za-z0-9_-]+$/;
 
 /**
@@ -105,14 +106,13 @@ export class GoogleDriveRepositoryStore implements RepositoryStore {
   async create(displayName: string): Promise<RemoteDescriptor> {
     const repositoryId = this.uuid();
     const metadata = parseRepositoryMetadata({
-      formatVersion: 1,
+      formatVersion: 2,
       repositoryId,
       displayName,
       objectFormat: "sha1",
       defaultBranch: "refs/heads/main",
-      bundleFileId: null,
-      bundleSha256: null,
       refs: {},
+      artifacts: [],
       generation: 1,
       updatedAt: this.now(),
       writerId: this.writerId,
@@ -153,68 +153,72 @@ export class GoogleDriveRepositoryStore implements RepositoryStore {
     };
   }
 
-  async downloadBundle(remote: RemoteDescriptor, destination: string): Promise<void> {
-    const { bundleFileId, bundleSha256 } = remote.metadata;
-    if (bundleFileId === null || bundleSha256 === null) {
-      throw bundleMissing();
-    }
-    const file = await this.call(() => this.drive.getFile({ fileId: bundleFileId }), "REMOTE_BUNDLE_MISSING");
-    if (!isManagedBundle(file, remote.metadata.repositoryId)) {
+  async downloadArtifact(
+    remote: RemoteDescriptor,
+    artifact: ArtifactDescriptor,
+    destination: string,
+  ): Promise<void> {
+    const file = await this.call(() => this.drive.getFile({ fileId: artifact.storageKey }), "REMOTE_BUNDLE_MISSING");
+    if (!isManagedArtifact(file, remote.metadata.repositoryId, artifact.id)) {
       throw bundleCorrupt();
     }
     const bytes = await this.call(() => this.drive.downloadFile(requiredFileId(file, "REMOTE_BUNDLE_MISSING")), "REMOTE_BUNDLE_MISSING");
-    if (file.size !== undefined && file.size !== null && Number(file.size) !== bytes.byteLength) {
+    if (bytes.byteLength !== artifact.size ||
+      (file.size !== undefined && file.size !== null && Number(file.size) !== bytes.byteLength)) {
       throw bundleCorrupt();
     }
-    if (sha256(bytes) !== bundleSha256.toLowerCase()) {
+    if (sha256(bytes) !== artifact.sha256) {
       throw bundleCorrupt();
     }
     await writeVerifiedDestination(destination, bytes, this.uuid);
   }
 
-  async publish(
-    remote: RemoteDescriptor,
-    bundlePath: string | null,
-    nextMetadata: RepositoryMetadata,
-  ): Promise<RemoteDescriptor> {
+  async publish(remote: RemoteDescriptor, change: RepositoryChange): Promise<RemoteDescriptor> {
     const current = await this.readDescriptor(remote.remoteId, remote.resourceKey);
     if (current.metadata.generation !== remote.metadata.generation) {
       throw remoteChanged();
     }
-    const validatedNext = parseRepositoryMetadata(nextMetadata);
-    const hasRefs = Object.keys(validatedNext.refs).length > 0;
-    if (validatedNext.repositoryId !== current.metadata.repositoryId ||
-      validatedNext.generation !== current.metadata.generation + 1 ||
-      (bundlePath === null) !== !hasRefs) {
-      throw invalidMetadata();
-    }
 
-    let bundleFileId: string | null = null;
-    let bundleSha256: string | null = null;
-    if (bundlePath !== null) {
-      const bytes = await readFile(bundlePath);
+    let artifactDescriptor: ArtifactDescriptor | null = null;
+    if (change.artifact !== null) {
+      const bytes = await readFile(change.artifact.path);
+      if (bytes.byteLength !== change.artifact.size || sha256(bytes) !== change.artifact.sha256) {
+        throw bundleCorrupt();
+      }
+      const artifactId = `artifact-${this.uuid()}`;
       const bundle = await this.call(() => this.drive.createFile({
-        name: "repository.bundle",
+        name: `${artifactId}.bundle`,
         mimeType: bundleMimeType,
         parents: [remote.remoteId],
-        appProperties: managedProperties(current.metadata.repositoryId, "bundle"),
+        appProperties: managedProperties(current.metadata.repositoryId, "artifact", artifactId),
         content: bytes,
         routing: makeResourceKeyRoute(remote.remoteId, remote.resourceKey),
       }));
-      bundleFileId = requiredFileId(bundle, "REMOTE_BUNDLE_MISSING");
+      const storageKey = requiredFileId(bundle, "REMOTE_BUNDLE_MISSING");
       const uploadedBundle = await this.call(
-        () => this.drive.getFile({ fileId: bundleFileId as string }),
+        () => this.drive.getFile({ fileId: storageKey }),
         "REMOTE_BUNDLE_MISSING",
       );
       await this.verifyUploadedBundle(uploadedBundle, bytes);
-      bundleSha256 = sha256(bytes);
+      artifactDescriptor = {
+        id: artifactId,
+        storageKey,
+        kind: change.artifact.kind,
+        sha256: change.artifact.sha256,
+        size: change.artifact.size,
+        prerequisites: change.artifact.prerequisites,
+        heads: change.artifact.heads,
+      };
     }
 
     const metadata = parseRepositoryMetadata({
-      ...validatedNext,
-      repositoryId: current.metadata.repositoryId,
-      bundleFileId,
-      bundleSha256,
+      ...current.metadata,
+      defaultBranch: change.defaultBranch,
+      refs: change.refs,
+      artifacts: artifactDescriptor === null
+        ? current.metadata.artifacts
+        : [...current.metadata.artifacts, artifactDescriptor],
+      generation: current.metadata.generation + 1,
       updatedAt: this.now(),
       writerId: this.writerId,
     });
@@ -228,7 +232,7 @@ export class GoogleDriveRepositoryStore implements RepositoryStore {
     }));
     const reread = await this.readDescriptor(remote.remoteId, remote.resourceKey);
     if (reread.metadata.generation !== metadata.generation ||
-      reread.metadata.bundleFileId !== metadata.bundleFileId) {
+      reread.metadata.artifacts.length !== metadata.artifacts.length) {
       throw remoteChanged();
     }
     return reread;
@@ -239,7 +243,6 @@ export class GoogleDriveRepositoryStore implements RepositoryStore {
       parentId: remoteId,
       appProperties: {
         "gitStorage.role": "metadata",
-        "gitStorage.formatVersion": formatVersion,
       },
       routing,
     }), "REMOTE_NOT_FOUND");
@@ -278,6 +281,9 @@ export class GoogleDriveRepositoryStore implements RepositoryStore {
         return await operation();
       } catch (error) {
         const status = statusCode(error);
+        if (status === 401) {
+          throw new GitStorageError("AUTH_REQUIRED", "Google Drive authentication expired.");
+        }
         if (status === 404 && missingCode !== undefined) {
           throw missingCode === "REMOTE_BUNDLE_MISSING" ? bundleMissing() : remoteNotFound();
         }
@@ -346,17 +352,23 @@ export function createGoogleDriveExternalClient(drive: drive_v3.Drive): DriveExt
   };
 }
 
-function managedProperties(repositoryId: string, role?: "metadata" | "bundle"): Record<string, string> {
+function managedProperties(
+  repositoryId: string,
+  role?: "metadata" | "artifact",
+  artifactId?: string,
+): Record<string, string> {
   return {
     "gitStorage.repositoryId": repositoryId,
     "gitStorage.formatVersion": formatVersion,
     ...(role === undefined ? {} : { "gitStorage.role": role }),
+    ...(artifactId === undefined ? {} : { "gitStorage.artifactId": artifactId }),
   };
 }
 
-function isManagedBundle(file: DriveFile, repositoryId: string): boolean {
+function isManagedArtifact(file: DriveFile, repositoryId: string, artifactId: string): boolean {
   return file.appProperties?.["gitStorage.repositoryId"] === repositoryId &&
-    file.appProperties["gitStorage.role"] === "bundle" &&
+    file.appProperties["gitStorage.role"] === "artifact" &&
+    file.appProperties["gitStorage.artifactId"] === artifactId &&
     file.appProperties["gitStorage.formatVersion"] === formatVersion;
 }
 

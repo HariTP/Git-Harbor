@@ -1,14 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { GitStorageError } from "../domain/errors.js";
 import {
   parseRepositoryMetadata,
   serializeRepositoryMetadata,
+  type ArtifactDescriptor,
   type RepositoryMetadata,
 } from "../domain/metadata.js";
-import type { RemoteDescriptor, RepositoryStore } from "./repository-store.js";
+import type {
+  RemoteDescriptor,
+  RepositoryChange,
+  RepositoryStore,
+} from "./repository-store.js";
 
 const safeIdentifier = /^[A-Za-z0-9_-]+$/;
 
@@ -17,13 +22,11 @@ export interface FilesystemRepositoryStoreOptions {
   readonly uuid?: () => string;
   readonly now?: () => string;
   readonly writerId?: string;
-  /** Test-only fault injection at the safe-publication seam. */
   readonly beforeMetadataPublication?: () => Promise<void> | void;
-  /** Test-only hook for simulating a concurrent metadata change. */
   readonly afterMetadataPublication?: () => Promise<void> | void;
 }
 
-/** A deterministic adapter for development and integration tests. */
+/** Deterministic adapter for development and repository-store contract tests. */
 export class FilesystemRepositoryStore implements RepositoryStore {
   private readonly rootDirectory: string;
   private readonly uuid: () => string;
@@ -44,15 +47,14 @@ export class FilesystemRepositoryStore implements RepositoryStore {
   async create(displayName: string): Promise<RemoteDescriptor> {
     const remoteId = `repository-${this.identifier(this.uuid())}`;
     const directory = this.remoteDirectory(remoteId);
-    const metadata: RepositoryMetadata = parseRepositoryMetadata({
-      formatVersion: 1,
+    const metadata = parseRepositoryMetadata({
+      formatVersion: 2,
       repositoryId: this.uuid(),
       displayName,
       objectFormat: "sha1",
       defaultBranch: "refs/heads/main",
-      bundleFileId: null,
-      bundleSha256: null,
       refs: {},
+      artifacts: [],
       generation: 1,
       updatedAt: this.now(),
       writerId: this.writerId,
@@ -63,104 +65,88 @@ export class FilesystemRepositoryStore implements RepositoryStore {
       await mkdir(this.rootDirectory, { recursive: true });
       await mkdir(directory, { recursive: false });
       createdDirectory = true;
-      await mkdir(join(directory, "bundles"));
+      await mkdir(join(directory, "artifacts"));
       await this.writeMetadata(directory, metadata);
     } catch (error) {
-      if (createdDirectory) {
-        await rm(directory, { recursive: true, force: true });
-      }
+      if (createdDirectory) await rm(directory, { recursive: true, force: true });
       throw error;
     }
-
     return { remoteId, metadata };
   }
 
   async readDescriptor(remoteId: string, resourceKey?: string): Promise<RemoteDescriptor> {
     void resourceKey;
-    const directory = this.remoteDirectory(remoteId);
-    let text: string;
     try {
-      text = await readFile(join(directory, "repository.json"), "utf8");
-    } catch (error) {
-      if (isMissing(error)) {
-        throw remoteNotFound();
-      }
-      throw error;
-    }
-
-    try {
+      const text = await readFile(join(this.remoteDirectory(remoteId), "repository.json"), "utf8");
       return { remoteId, metadata: parseRepositoryMetadata(JSON.parse(text)) };
     } catch (error) {
-      if (error instanceof GitStorageError) {
-        throw error;
-      }
+      if (isMissing(error)) throw remoteNotFound();
+      if (error instanceof GitStorageError) throw error;
       throw invalidMetadata();
     }
   }
 
-  async downloadBundle(remote: RemoteDescriptor, destination: string): Promise<void> {
-    const metadata = remote.metadata;
-    if (metadata.bundleFileId === null || metadata.bundleSha256 === null) {
-      throw bundleMissing();
-    }
-
-    const source = this.bundlePath(remote.remoteId, metadata.bundleFileId);
+  async downloadArtifact(
+    remote: RemoteDescriptor,
+    artifact: ArtifactDescriptor,
+    destination: string,
+  ): Promise<void> {
+    const source = this.artifactPath(remote.remoteId, artifact.storageKey);
     const temporary = this.destinationTemporaryPath(destination);
     try {
       await copyFile(source, temporary);
-      const digest = await sha256File(temporary);
-      if (digest !== metadata.bundleSha256.toLowerCase()) {
-        throw bundleCorrupt();
+      const info = await stat(temporary);
+      if (info.size !== artifact.size || await sha256File(temporary) !== artifact.sha256) {
+        throw artifactCorrupt();
       }
       await rename(temporary, destination);
     } catch (error) {
       await rm(temporary, { force: true });
-      if (isMissing(error)) {
-        throw bundleMissing();
-      }
+      if (isMissing(error)) throw artifactMissing();
       throw error;
     }
   }
 
-  async publish(
-    remote: RemoteDescriptor,
-    bundlePath: string | null,
-    nextMetadata: RepositoryMetadata,
-  ): Promise<RemoteDescriptor> {
+  async publish(remote: RemoteDescriptor, change: RepositoryChange): Promise<RemoteDescriptor> {
     const current = await this.readDescriptor(remote.remoteId);
-    if (current.metadata.generation !== remote.metadata.generation) {
-      throw remoteChanged();
-    }
-    const validatedNext = parseRepositoryMetadata(nextMetadata);
-    const hasRefs = Object.keys(validatedNext.refs).length > 0;
-    if (validatedNext.repositoryId !== current.metadata.repositoryId ||
-      validatedNext.generation !== current.metadata.generation + 1 ||
-      (bundlePath === null) !== !hasRefs) {
-      throw invalidMetadata();
-    }
+    if (current.metadata.generation !== remote.metadata.generation) throw remoteChanged();
 
-    let bundleFileId: string | null = null;
-    let bundleSha256: string | null = null;
-    if (bundlePath !== null) {
-      bundleFileId = `bundle-${this.identifier(this.uuid())}`;
-      const destination = this.bundlePath(remote.remoteId, bundleFileId);
+    let artifactDescriptor: ArtifactDescriptor | null = null;
+    if (change.artifact !== null) {
+      const artifactId = `artifact-${this.identifier(this.uuid())}`;
+      const destination = this.artifactPath(remote.remoteId, artifactId);
       const temporary = `${destination}.${this.identifier(this.uuid())}.tmp`;
       try {
-        await copyFile(bundlePath, temporary);
-        bundleSha256 = await sha256File(temporary);
+        await copyFile(change.artifact.path, temporary);
+        const info = await stat(temporary);
+        const digest = await sha256File(temporary);
+        if (info.size !== change.artifact.size || digest !== change.artifact.sha256) {
+          throw artifactCorrupt();
+        }
         await rename(temporary, destination);
-      } catch (error) {
+        artifactDescriptor = {
+          id: artifactId,
+          storageKey: artifactId,
+          kind: change.artifact.kind,
+          sha256: digest,
+          size: info.size,
+          prerequisites: change.artifact.prerequisites,
+          heads: change.artifact.heads,
+        };
+      } finally {
         await rm(temporary, { force: true });
-        throw error;
       }
     }
-    await this.beforeMetadataPublication?.();
 
+    await this.beforeMetadataPublication?.();
     const metadata = parseRepositoryMetadata({
-      ...validatedNext,
-      repositoryId: current.metadata.repositoryId,
-      bundleFileId,
-      bundleSha256,
+      ...current.metadata,
+      defaultBranch: change.defaultBranch,
+      refs: change.refs,
+      artifacts: artifactDescriptor === null
+        ? current.metadata.artifacts
+        : [...current.metadata.artifacts, artifactDescriptor],
+      generation: current.metadata.generation + 1,
       updatedAt: this.now(),
       writerId: this.writerId,
     });
@@ -168,7 +154,7 @@ export class FilesystemRepositoryStore implements RepositoryStore {
     await this.afterMetadataPublication?.();
     const reread = await this.readDescriptor(remote.remoteId);
     if (reread.metadata.generation !== metadata.generation ||
-      reread.metadata.bundleFileId !== metadata.bundleFileId) {
+      reread.metadata.artifacts.length !== metadata.artifacts.length) {
       throw remoteChanged();
     }
     return reread;
@@ -178,14 +164,12 @@ export class FilesystemRepositoryStore implements RepositoryStore {
     return join(this.rootDirectory, this.identifier(remoteId));
   }
 
-  private bundlePath(remoteId: string, bundleId: string): string {
-    return join(this.remoteDirectory(remoteId), "bundles", `${this.identifier(bundleId)}.bundle`);
+  private artifactPath(remoteId: string, artifactId: string): string {
+    return join(this.remoteDirectory(remoteId), "artifacts", `${this.identifier(artifactId)}.bundle`);
   }
 
   private identifier(value: string): string {
-    if (!safeIdentifier.test(value)) {
-      throw remoteNotFound();
-    }
+    if (!safeIdentifier.test(value)) throw remoteNotFound();
     return value;
   }
 
@@ -216,19 +200,15 @@ function isMissing(error: unknown): error is NodeJS.ErrnoException {
 function remoteNotFound(): GitStorageError {
   return new GitStorageError("REMOTE_NOT_FOUND", "The repository remote was not found.");
 }
-
 function invalidMetadata(): GitStorageError {
   return new GitStorageError("REMOTE_METADATA_INVALID", "The repository metadata is invalid.");
 }
-
-function bundleMissing(): GitStorageError {
-  return new GitStorageError("REMOTE_BUNDLE_MISSING", "The repository bundle is missing.");
+function artifactMissing(): GitStorageError {
+  return new GitStorageError("REMOTE_BUNDLE_MISSING", "The repository artifact is missing.");
 }
-
-function bundleCorrupt(): GitStorageError {
-  return new GitStorageError("REMOTE_BUNDLE_CORRUPT", "The repository bundle failed checksum verification.");
+function artifactCorrupt(): GitStorageError {
+  return new GitStorageError("REMOTE_BUNDLE_CORRUPT", "The repository artifact failed verification.");
 }
-
 function remoteChanged(): GitStorageError {
   return new GitStorageError("REMOTE_CHANGED_DURING_PUSH", "The remote changed during publication.");
 }

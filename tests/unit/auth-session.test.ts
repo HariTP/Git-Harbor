@@ -140,6 +140,33 @@ describe("AuthSession", () => {
     });
   });
 
+  it("reauthenticates using the already stored desktop credentials", async () => {
+    await withIsolatedEnvironment(async ({ configDir, writeFile }) => {
+      await writeFile("config/oauth-client.json", desktopCredentials);
+      await writeFile("config/token.json", JSON.stringify(refreshableToken));
+      const openBrowser = vi.fn(async () => undefined);
+      const session = new AuthSessionImpl({
+        configRoot: () => configDir,
+        openBrowser,
+        startLoopbackAuthorization: async () => ({
+          redirectUri: "http://127.0.0.1:43210/oauth2callback",
+          waitForCallback: async () => ({ code: "authorization-code" }),
+          close: async () => undefined,
+        }),
+        createOAuthClient: () => ({
+          generateAuthUrl: () => "https://accounts.example.test/authorize",
+          getToken: async () => ({ tokens: refreshableToken }),
+          setCredentials: () => undefined,
+          getAccessToken: async () => ({ token: "unused" }),
+          credentials: {},
+        }) as never,
+      });
+
+      await expect(session.reauthenticate()).resolves.toBeUndefined();
+      expect(openBrowser).toHaveBeenCalledWith("https://accounts.example.test/authorize");
+    });
+  });
+
   it("refreshes an expired stored token before reporting a usable status", async () => {
     await withIsolatedEnvironment(async ({ configDir, writeFile }) => {
       await writeFile("config/oauth-client.json", desktopCredentials);

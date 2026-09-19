@@ -122,7 +122,7 @@ describe("git-remote-gdrive push protocol", () => {
     expect(await ref(fixture, restored, "refs/remotes/origin/keep")).toBeNull();
     expect(remoteMain).not.toBe(divergent);
     expect(keep).not.toBe(divergent);
-    await expect(git(fixture, restored, ["fsck", "--full"])).resolves.toBe("");
+    await expect(git(fixture, restored, ["fsck", "--full"])).resolves.toContain("dangling commit");
   }, 30_000);
 });
 

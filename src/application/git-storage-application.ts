@@ -1,5 +1,4 @@
 import { GitStorageError } from "../domain/errors.js";
-import type { RepositoryMetadata } from "../domain/metadata.js";
 import {
   type ObjectId,
   type PushRefspec,
@@ -18,6 +17,7 @@ export interface FetchRequest {
   readonly remoteId: string;
   readonly resourceKey?: string;
   readonly targetGitDir: string;
+  readonly wants?: readonly ObjectId[];
   readonly temporaryDirectoryParent?: string;
 }
 
@@ -93,13 +93,23 @@ export class GitStorageApplication {
 
   async fetch(request: FetchRequest): Promise<void> {
     const remote = await this.store.readDescriptor(request.remoteId, request.resourceKey);
-    if (remote.metadata.bundleFileId === null) {
+    const wants = request.wants ?? Object.values(remote.metadata.refs).map(validateObjectId);
+    if (await this.hasAllObjects(request.targetGitDir, wants)) {
       return;
     }
     await this.withTemporaryDirectory(request.temporaryDirectoryParent, async (directory) => {
-      const bundlePath = `${directory}/repository.bundle`;
-      await this.store.downloadBundle(remote, bundlePath);
-      await this.git.importBundle(bundlePath, request.targetGitDir);
+      for (const [index, artifact] of remote.metadata.artifacts.entries()) {
+        if (await this.hasAllObjects(request.targetGitDir, Object.values(artifact.heads).map(validateObjectId))) {
+          continue;
+        }
+        const bundlePath = `${directory}/artifact-${index}.bundle`;
+        await this.store.downloadArtifact(remote, artifact, bundlePath);
+        await this.git.importArtifact(bundlePath, request.targetGitDir);
+        if (await this.hasAllObjects(request.targetGitDir, wants)) return;
+      }
+      if (!(await this.hasAllObjects(request.targetGitDir, wants))) {
+        throw new GitStorageError("REMOTE_BUNDLE_CORRUPT", "The remote artifacts do not contain the requested objects.");
+      }
     });
   }
 
@@ -107,23 +117,24 @@ export class GitStorageApplication {
     const remote = await this.store.readDescriptor(request.remoteId, request.resourceKey);
     try {
       await this.withTemporaryDirectory(request.temporaryDirectoryParent, async (directory) => {
-        const existingBundlePath = remote.metadata.bundleFileId === null ? null : `${directory}/current.bundle`;
-        if (existingBundlePath !== null) {
-          await this.store.downloadBundle(remote, existingBundlePath);
-        }
-        const bundlePath = `${directory}/replacement.bundle`;
-        const result = await this.git.buildNextBundle({
-          existingBundlePath,
+        const bundlePath = `${directory}/incremental.bundle`;
+        const result = await this.git.buildIncrementalArtifact({
+          currentRefs: remote.metadata.refs,
+          hasRemoteArtifacts: remote.metadata.artifacts.length > 0,
           localGitDir: request.localGitDir,
           updates: request.updates,
           outputBundlePath: bundlePath,
           temporaryDirectoryParent: directory,
         });
-        await this.store.publish(
-          remote,
-          result.bundlePath,
-          nextMetadata(remote.metadata, result.refs, result.bundleSha256),
-        );
+        const defaultBranch = Object.hasOwn(result.refs, remote.metadata.defaultBranch)
+          ? remote.metadata.defaultBranch
+          : Object.keys(result.refs).filter((ref) => ref.startsWith("refs/heads/")).sort()[0]
+            ?? remote.metadata.defaultBranch;
+        await this.store.publish(remote, {
+          artifact: result.artifact,
+          refs: result.refs,
+          defaultBranch,
+        });
       });
       return request.updates.map((update) => ({ destination: validateRemoteRef(update.destination), ok: true }));
     } catch (error) {
@@ -162,25 +173,11 @@ export class GitStorageApplication {
       await rm(directory, { recursive: true, force: true });
     }
   }
-}
 
-function nextMetadata(
-  current: RepositoryMetadata,
-  refs: Readonly<Record<RemoteRefName, ObjectId>>,
-  bundleSha256: string | null,
-): RepositoryMetadata {
-  const hasRefs = Object.keys(refs).length > 0;
-  const defaultBranch = Object.hasOwn(refs, current.defaultBranch)
-    ? current.defaultBranch
-    : Object.keys(refs)
-      .filter((refname) => refname.startsWith("refs/heads/"))
-      .sort()[0] ?? current.defaultBranch;
-  return {
-    ...current,
-    defaultBranch,
-    bundleFileId: hasRefs ? "pending-bundle" : null,
-    bundleSha256: hasRefs ? bundleSha256 : null,
-    refs,
-    generation: current.generation + 1,
-  };
+  private async hasAllObjects(gitDir: string, objectIds: readonly ObjectId[]): Promise<boolean> {
+    for (const objectId of objectIds) {
+      if (!(await this.git.hasObject(gitDir, objectId))) return false;
+    }
+    return true;
+  }
 }

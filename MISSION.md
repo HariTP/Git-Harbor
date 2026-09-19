@@ -92,9 +92,9 @@ Google Drive stores repository bundles and metadata. It is not expected to behav
 
 Do not add distributed locking, coordination servers, or team permission systems to solve problems the MVP does not claim to support.
 
-### Prefer a complete backup over a clever protocol
+### Prefer Git-native, verifiable artifacts
 
-A simple, verifiable full-repository bundle is better than an intricate incremental format that is difficult to recover.
+Use Git's bundle prerequisites and verification rather than inventing an object protocol. Start with a self-contained base, append incremental bundles, and keep recovery possible with ordinary Git commands.
 
 ### Make failure understandable
 
@@ -117,4 +117,3 @@ If the answer to all three is no, the work should probably not be part of the MV
 ## Final statement
 
 Our mission is to build a small, reliable, and amusing proof of concept that lets one person use their own Google Drive as a backup Git remote through familiar Git commands—and nothing more.
-

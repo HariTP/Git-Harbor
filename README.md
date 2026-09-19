@@ -1,6 +1,6 @@
 # Git Storage
 
-Git Storage is an experimental Git remote helper that uses a folder in your own Google Drive as a backup remote. Git continues to own commits, refs, merges, rebases, and integrity checks; Git Storage turns each remote state into a complete, verified Git bundle plus small metadata in Drive.
+Git Storage is an experimental Git remote helper that uses a folder in your own Google Drive as a backup remote. Git continues to own commits, refs, merges, rebases, and integrity checks; Git Storage stores an ordered chain of verified, immutable Git bundles plus small metadata in Drive.
 
 > [!WARNING]
 > This is a single-user, single-writer side project. Do not push to the same Drive remote concurrently. It is designed as a personal backup or secondary remote, not as a replacement for GitHub, GitLab, or another collaborative forge.
@@ -71,6 +71,16 @@ The installation exposes both `git-gdrive` and `git-remote-gdrive`. Git invokes 
 
 The login uses a loopback callback on `localhost`, requests offline access, and requests only the per-file `https://www.googleapis.com/auth/drive.file` scope. Google’s current setup guidance is in the [Drive API Node.js quickstart](https://developers.google.com/workspace/drive/api/quickstart/nodejs); scope details are in the [Drive authorization guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
 
+The project uses bring-your-own OAuth credentials: every user owns their Google Cloud project, API quota, Desktop OAuth client, and authorization. Keep that Cloud project and OAuth client active while its Drive remotes are needed.
+
+If Google later rejects the stored refresh token during `push`, `fetch`, `pull`, `clone`, or `init`, Git Storage prompts on the controlling terminal:
+
+```text
+Google Drive authentication expired. Sign in again using your browser? [Y/n]
+```
+
+Enter or `y` opens the provider's browser authorization flow, stores the replacement token, rebuilds the provider client, and retries the interrupted operation once. `n` cancels it. Git's remote-helper stdin/stdout remain reserved for Git protocol traffic; the prompt uses the controlling terminal directly.
+
 ## Create and use a remote
 
 Create an empty Drive-backed remote:
@@ -113,7 +123,7 @@ Delete a remote ref with normal Git syntax:
 git push backup --delete obsolete-branch
 ```
 
-The first branch published to an empty remote becomes its default branch, so a first push to `trunk` makes a fresh clone check out `trunk`. If the default branch is later deleted, Git Storage selects the lexicographically first remaining branch; deleting the final ref leaves a valid empty remote. Previously uploaded bundles are deliberately retained for recovery.
+The first push creates a self-contained base bundle. Later pushes upload only newly required Git objects in incremental bundles when possible. Creating a branch or lightweight tag at an object already stored remotely updates metadata without uploading an empty bundle. The first branch published to an empty remote becomes its default branch, so a first push to `trunk` makes a fresh clone check out `trunk`. If the default branch is later deleted, Git Storage selects the lexicographically first remaining branch; deleting the final ref leaves a valid empty remote. Previously uploaded artifacts are deliberately retained for recovery.
 
 ## Why a Drive HTTPS link is not a Git remote
 
@@ -150,15 +160,18 @@ git -C recovered fsck --full
 git -C recovered show-ref
 ```
 
-Each successful push uploads a new complete bundle before publishing new metadata. The previous metadata remains authoritative if upload or verification fails, and superseded bundle objects are not automatically deleted. If the current metadata is damaged, download a known-good earlier `repository.bundle` object from the managed Drive folder, then recover it with Git itself:
+The first successful push uploads a complete base bundle. Later pushes append immutable incremental bundles with explicit Git prerequisites, then publish metadata last. Fetch verifies prerequisites and downloads only artifacts needed for the requested objects. The previous metadata remains authoritative if upload or verification fails, and older artifacts are not automatically deleted.
+
+To recover manually, download the current base artifact and its following incremental artifacts in metadata order. Import the base first, then verify and import each incremental artifact:
 
 ```bash
-git bundle verify /path/to/repository.bundle
-git clone /path/to/repository.bundle recovered-from-bundle
+git clone /path/to/base.bundle recovered-from-bundle
+git -C recovered-from-bundle bundle verify /path/to/incremental.bundle
+git -C recovered-from-bundle bundle unbundle /path/to/incremental.bundle
 git -C recovered-from-bundle fsck --full
 ```
 
-Do not hand-edit `repository.json` unless you have separately preserved the whole Drive folder and understand the format. File IDs, not displayed filenames, identify the active metadata and bundle objects.
+Do not hand-edit `repository.json` unless you have separately preserved the whole Drive folder and understand the format. Provider storage keys, not displayed filenames, identify the artifact objects.
 
 ## Security and local data
 
@@ -189,16 +202,16 @@ It checks Node, Git, OAuth credentials, refreshable authentication, read-only Dr
 - **Authentication worked and later expired** — External OAuth apps left in Google’s Testing publishing status normally receive refresh tokens that expire after seven days. Add the account as a test user and rerun login, or choose the appropriate publishing status for your private project; see Google’s [OAuth expiration guidance](https://developers.google.com/identity/protocols/oauth2#expiration).
 - **Permission denied** — confirm the same Google account authorized the app and owns the managed folder. The MVP does not implement multi-user sharing or permission repair.
 - **Rate limited or temporarily offline** — wait and retry. Drive retryable network, `429`, and server errors use bounded backoff; persistent failures return a stable error without replacing the prior valid metadata.
-- **Bundle missing or corrupt** — stop pushing, preserve the Drive folder, try an independent clone, and inspect an earlier retained bundle as described under Recovery.
+- **Bundle missing or corrupt** — stop pushing, preserve the Drive folder, try an independent clone, and inspect the retained base/incremental chain as described under Recovery.
 
 ## MVP limitations
 
 - One user and one writer at a time; no locking or concurrent-push support.
 - SHA-1 repositories only.
-- Complete bundles are uploaded on each successful push; this is intentionally simple and can be slow for large repositories.
+- The first push is a complete base; later pushes are incremental. Automatic compaction into a newer base is not included yet, so long-lived remotes accumulate an artifact chain.
 - No shallow clones, partial clones, Git LFS transport, submodule hosting, or advanced server features.
 - No web UI, hosted backend, collaboration, pull requests, permissions system, hooks, or CI integration.
-- Superseded Drive bundle objects are retained; automatic garbage collection is not included.
+- Drive artifacts are retained; automatic compaction and garbage collection are not included.
 - The OAuth flow is interactive and browser-based.
 
 ## Local development

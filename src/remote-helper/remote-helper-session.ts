@@ -125,6 +125,7 @@ export class RemoteHelperSession {
           remoteId: this.remoteId,
           resourceKey: this.resourceKey,
           targetGitDir: this.gitDirectory,
+          wants: pending.commands.map((command) => command.objectId),
         });
         this.write(output, "\n");
         return undefined;

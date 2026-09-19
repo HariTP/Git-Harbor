@@ -7,6 +7,7 @@ import { OAuth2Client, type Credentials } from "google-auth-library";
 import open from "open";
 
 import { GitStorageError } from "../domain/errors.js";
+import type { ProviderAuthenticator } from "./authentication-recovery.js";
 import { resolveConfigPaths, type ConfigPaths } from "./config-paths.js";
 
 const driveFileScope = "https://www.googleapis.com/auth/drive.file";
@@ -18,7 +19,7 @@ export interface AuthStatus {
   readonly isUsable: boolean;
 }
 
-export interface AuthSession {
+export interface AuthSession extends ProviderAuthenticator {
   login(credentialsPath: string): Promise<AuthStatus>;
   status(): Promise<AuthStatus>;
   logout(): Promise<void>;
@@ -65,6 +66,7 @@ export interface AuthSessionDependencies {
 }
 
 export class AuthSessionImpl implements AuthSession {
+  readonly providerName = "Google Drive";
   private readonly dependencies: Required<AuthSessionDependencies>;
 
   constructor(dependencies: AuthSessionDependencies = {}) {
@@ -131,6 +133,10 @@ export class AuthSessionImpl implements AuthSession {
     } finally {
       await loopback.close();
     }
+  }
+
+  async reauthenticate(): Promise<void> {
+    await this.login(this.paths().oauthClient);
   }
 
   async status(): Promise<AuthStatus> {
@@ -340,7 +346,9 @@ function retainRefreshToken(token: Credentials, prior: Credentials | null): Cred
 }
 
 function isExpired(token: Credentials, now: number): boolean {
-  return typeof token.expiry_date === "number" && token.expiry_date <= now;
+  return typeof token.access_token !== "string" ||
+    typeof token.expiry_date !== "number" ||
+    token.expiry_date <= now;
 }
 
 function availableStatus(): AuthStatus {

@@ -141,7 +141,12 @@ describe("git-remote-gdrive fetch protocol", () => {
 
     expect(calls).toEqual([
       ["list", "shared-folder", "routing-key"],
-      ["fetch", { remoteId: "shared-folder", resourceKey: "routing-key", targetGitDir: "/tmp/repository.git" }],
+      ["fetch", {
+        remoteId: "shared-folder",
+        resourceKey: "routing-key",
+        targetGitDir: "/tmp/repository.git",
+        wants: ["a".repeat(40)],
+      }],
       ["push", {
         remoteId: "shared-folder",
         resourceKey: "routing-key",
@@ -348,7 +353,7 @@ function runGit(arguments_: readonly string[], cwd: string, environment: NodeJS.
         resolvePromise({ stdout: standardOutput });
         return;
       }
-      const error = Object.assign(new Error("Git command failed."), {
+      const error = Object.assign(new Error(`Git command failed: git ${arguments_.join(" ")}\n${standardError}`), {
         exitCode: exitCode ?? 1,
         stdout: standardOutput,
         stderr: standardError,

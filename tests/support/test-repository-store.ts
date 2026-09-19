@@ -60,7 +60,7 @@ export class TestDriveClient implements DriveExternalClient {
 
   async createFile(input: DriveCreateFileInput): Promise<DriveFile> {
     this.ensureExternalCallsAllowed();
-    if (input.name === "repository.bundle" && this.bundleUploadsRejected) {
+    if (input.name.endsWith(".bundle") && this.bundleUploadsRejected) {
       throw new Error("bundle upload was not expected");
     }
     for (const parent of input.parents ?? []) {
@@ -89,11 +89,11 @@ export class TestDriveClient implements DriveExternalClient {
     this.requireExpectedRoute(input.fileId, input.routing);
     this.throwQueued("get");
     const file = this.required(input.fileId);
-    if (this.corruptNextBundleRead && file.name === "repository.bundle") {
+    if (this.corruptNextBundleRead && file.name.endsWith(".bundle")) {
       this.corruptNextBundleRead = false;
       return { ...publicFile(file), size: String(file.content.byteLength + 1) };
     }
-    if (this.mismatchNextBundleProperties && file.name === "repository.bundle") {
+    if (this.mismatchNextBundleProperties && file.name.endsWith(".bundle")) {
       this.mismatchNextBundleProperties = false;
       return {
         ...publicFile(file),
@@ -164,21 +164,19 @@ function validateManagedProperties(input: DriveCreateFileInput): void {
   const properties = input.appProperties;
   if (input.mimeType === "application/vnd.google-apps.folder") {
     if (properties?.["gitStorage.repositoryId"] === undefined ||
-      properties["gitStorage.formatVersion"] !== "1" ||
+      properties["gitStorage.formatVersion"] !== "2" ||
       properties["gitStorage.role"] !== undefined) {
       throw new Error("invalid managed folder properties");
     }
     return;
   }
-  const expectedRole = input.name === "repository.json"
-    ? "metadata"
-    : input.name === "repository.bundle"
-      ? "bundle"
-      : undefined;
+  const expectedRole = input.name === "repository.json" ? "metadata"
+    : input.name.endsWith(".bundle") ? "artifact" : undefined;
   if (expectedRole !== undefined &&
     (properties?.["gitStorage.repositoryId"] === undefined ||
-      properties["gitStorage.formatVersion"] !== "1" ||
-      properties["gitStorage.role"] !== expectedRole)) {
+      properties["gitStorage.formatVersion"] !== "2" ||
+      properties["gitStorage.role"] !== expectedRole ||
+      (expectedRole === "artifact" && properties["gitStorage.artifactId"] === undefined))) {
     throw new Error("invalid managed file properties");
   }
 }

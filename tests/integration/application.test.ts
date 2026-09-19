@@ -5,10 +5,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { GitStorageApplication } from "../../src/application/git-storage-application.js";
-import type { RepositoryMetadata } from "../../src/domain/metadata.js";
+import { createGitStorageRuntime } from "../../src/application/runtime.js";
+import type { AuthSession } from "../../src/auth/auth-session.js";
+import type { ArtifactDescriptor } from "../../src/domain/metadata.js";
 import { GitRepositoryEngine } from "../../src/git/git-repository-engine.js";
 import { FilesystemRepositoryStore } from "../../src/storage/filesystem-repository-store.js";
-import type { RemoteDescriptor, RepositoryStore } from "../../src/storage/repository-store.js";
+import type { RemoteDescriptor, RepositoryChange, RepositoryStore } from "../../src/storage/repository-store.js";
 import { withGitFixture } from "../support/git-fixture.js";
 
 const directories: string[] = [];
@@ -37,8 +39,7 @@ describe("GitStorageApplication", () => {
     expect(remote.metadata).toMatchObject({
       displayName: "my-repository",
       generation: 1,
-      bundleFileId: null,
-      bundleSha256: null,
+      artifacts: [],
       refs: {},
     });
     expect(await store.readDescriptor(remote.remoteId)).toEqual(remote);
@@ -125,8 +126,8 @@ describe("GitStorageApplication", () => {
         generation: 2,
         refs: { "refs/heads/main": main },
       });
-      expect(published.metadata.bundleFileId).not.toBeNull();
-      expect(published.metadata.bundleSha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(published.metadata.artifacts).toHaveLength(1);
+      expect(published.metadata.artifacts[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
       await expect(application.listRemote(remote.remoteId)).resolves.toEqual({
         defaultBranch: "refs/heads/main",
         refs: [{ name: "refs/heads/main", objectId: main }],
@@ -238,6 +239,7 @@ describe("GitStorageApplication", () => {
       const remote = await application.createRemote("my-repository");
       const update = { kind: "update" as const, source: "main", destination: "refs/heads/main", force: false };
       await application.push({ remoteId: remote.remoteId, localGitDir: fixture.repository, updates: [update] });
+      const firstPublished = await store.readDescriptor(remote.remoteId);
       const next = await fixture.commit("readme.txt", "two\n", "fast-forward commit");
 
       await expect(application.push({
@@ -246,10 +248,42 @@ describe("GitStorageApplication", () => {
         updates: [update],
       })).resolves.toEqual([{ destination: "refs/heads/main", ok: true }]);
 
-      expect((await store.readDescriptor(remote.remoteId)).metadata).toMatchObject({
+      const published = await store.readDescriptor(remote.remoteId);
+      expect(published.metadata).toMatchObject({
         generation: 3,
         refs: { "refs/heads/main": next },
       });
+      expect(published.metadata.artifacts).toHaveLength(2);
+      expect(published.metadata.artifacts[0]?.kind).toBe("base");
+      expect(published.metadata.artifacts[1]).toMatchObject({
+        kind: "incremental",
+        prerequisites: [firstPublished.metadata.refs["refs/heads/main"]],
+      });
+    });
+  });
+
+  test("fetch skips base artifacts already present locally", async () => {
+    await withGitFixture(async (fixture) => {
+      const first = await fixture.commit("readme.txt", "one\n", "first");
+      const destination = join(await temporaryDirectory(), "restored.git");
+      const baseStore = new FilesystemRepositoryStore({
+        rootDirectory: await temporaryDirectory(), writerId: "test", uuid: sequenceUuid(),
+      });
+      const store = new RecordingRepositoryStore(baseStore);
+      const application = new GitStorageApplication({ store, git: new GitRepositoryEngine() });
+      const remote = await application.createRemote("my-repository");
+      const update = { kind: "update" as const, source: "main", destination: "refs/heads/main", force: false };
+      await application.push({ remoteId: remote.remoteId, localGitDir: fixture.repository, updates: [update] });
+      await fixture.git(fixture.root, ["init", "--bare", destination]);
+      await application.fetch({ remoteId: remote.remoteId, targetGitDir: destination, wants: [first] });
+
+      const second = await fixture.commit("readme.txt", "two\n", "second");
+      await application.push({ remoteId: remote.remoteId, localGitDir: fixture.repository, updates: [update] });
+      await application.fetch({ remoteId: remote.remoteId, targetGitDir: destination, wants: [second] });
+
+      expect(store.artifactDownloads).toHaveLength(2);
+      expect(new Set(store.artifactDownloads).size).toBe(2);
+      await expect(fixture.git(destination, ["cat-file", "-e", `${second}^{commit}`])).resolves.toBe("");
     });
   });
 
@@ -357,10 +391,9 @@ describe("GitStorageApplication", () => {
 
       expect((await store.readDescriptor(remote.remoteId)).metadata).toMatchObject({
         generation: 3,
-        bundleFileId: null,
-        bundleSha256: null,
         refs: {},
       });
+      expect((await store.readDescriptor(remote.remoteId)).metadata.artifacts).toHaveLength(1);
       await expect(application.listRemote(remote.remoteId)).resolves.toEqual({
         defaultBranch: "refs/heads/main",
         refs: [],
@@ -431,7 +464,7 @@ describe("GitStorageApplication", () => {
 
       expect((await store.readDescriptor(remote.remoteId)).metadata).toMatchObject({
         generation: 2,
-        bundleFileId: null,
+        artifacts: [],
         refs: {},
       });
     });
@@ -459,6 +492,41 @@ describe("GitStorageApplication", () => {
       ],
     });
   });
+
+  test("reauthenticates and retries a provider operation after confirmation", async () => {
+    let installationAttempts = 0;
+    let reauthenticated = false;
+    const auth: AuthSession = {
+      providerName: "Example Drive",
+      login: async () => { throw new Error("not used"); },
+      status: async () => ({ hasCredentials: true, hasRefreshToken: true, isUsable: true }),
+      logout: async () => undefined,
+      getAuthorizedClient: async () => { throw new Error("not used"); },
+      getInstallationId: async () => {
+        installationAttempts += 1;
+        if (!reauthenticated) {
+          const { GitStorageError } = await import("../../src/domain/errors.js");
+          throw new GitStorageError("AUTH_REFRESH_FAILED", "expired");
+        }
+        return "00000000-0000-4000-8000-000000000001";
+      },
+      reauthenticate: async () => { reauthenticated = true; },
+    };
+    const prompt = { confirm: async () => true };
+    const runtime = createGitStorageRuntime({
+      auth,
+      authenticationPrompt: prompt,
+      environment: {
+        ...process.env,
+        GIT_GDRIVE_FILESYSTEM_STORE_DIR: await temporaryDirectory(),
+      },
+    });
+
+    await expect(runtime.application.createRemote("recovered-auth")).resolves.toMatchObject({
+      metadata: { displayName: "recovered-auth" },
+    });
+    expect(installationAttempts).toBe(2);
+  });
 });
 
 function sequenceUuid(): () => string {
@@ -468,6 +536,7 @@ function sequenceUuid(): () => string {
 
 class RecordingRepositoryStore implements RepositoryStore {
   readonly descriptorReads: Array<{ readonly remoteId: string; readonly resourceKey?: string }> = [];
+  readonly artifactDownloads: string[] = [];
 
   constructor(private readonly store: RepositoryStore) {}
 
@@ -480,16 +549,13 @@ class RecordingRepositoryStore implements RepositoryStore {
     return this.store.readDescriptor(remoteId, resourceKey);
   }
 
-  downloadBundle(remote: RemoteDescriptor, destination: string): Promise<void> {
-    return this.store.downloadBundle(remote, destination);
+  downloadArtifact(remote: RemoteDescriptor, artifact: ArtifactDescriptor, destination: string): Promise<void> {
+    this.artifactDownloads.push(artifact.id);
+    return this.store.downloadArtifact(remote, artifact, destination);
   }
 
-  publish(
-    remote: RemoteDescriptor,
-    bundlePath: string | null,
-    nextMetadata: RepositoryMetadata,
-  ): Promise<RemoteDescriptor> {
-    return this.store.publish(remote, bundlePath, nextMetadata);
+  publish(remote: RemoteDescriptor, change: RepositoryChange): Promise<RemoteDescriptor> {
+    return this.store.publish(remote, change);
   }
 }
 
@@ -506,24 +572,20 @@ class GenerationRaceStore implements RepositoryStore {
     const descriptor = await this.store.readDescriptor(remoteId, resourceKey);
     if (!this.raced) {
       this.raced = true;
-      await this.store.publish(descriptor, null, changedMetadata(descriptor.metadata));
+      await this.store.publish(descriptor, {
+        artifact: null,
+        refs: descriptor.metadata.refs,
+        defaultBranch: descriptor.metadata.defaultBranch,
+      });
     }
     return descriptor;
   }
 
-  downloadBundle(remote: RemoteDescriptor, destination: string): Promise<void> {
-    return this.store.downloadBundle(remote, destination);
+  downloadArtifact(remote: RemoteDescriptor, artifact: ArtifactDescriptor, destination: string): Promise<void> {
+    return this.store.downloadArtifact(remote, artifact, destination);
   }
 
-  publish(
-    remote: RemoteDescriptor,
-    bundlePath: string | null,
-    nextMetadata: RepositoryMetadata,
-  ): Promise<RemoteDescriptor> {
-    return this.store.publish(remote, bundlePath, nextMetadata);
+  publish(remote: RemoteDescriptor, change: RepositoryChange): Promise<RemoteDescriptor> {
+    return this.store.publish(remote, change);
   }
-}
-
-function changedMetadata(metadata: RepositoryMetadata): RepositoryMetadata {
-  return { ...metadata, generation: metadata.generation + 1 };
 }

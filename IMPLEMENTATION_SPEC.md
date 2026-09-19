@@ -1,5 +1,7 @@
 # Git Storage — Implementation Specification
 
+> **Format-v2 update:** The original format-v1 complete-replacement-bundle design below is retained as historical implementation context. The active storage design is the provider-neutral incremental artifact chain in [`INCREMENTAL_STORAGE.md`](./INCREMENTAL_STORAGE.md). Format-v1 remotes are intentionally unsupported and must be recreated.
+
 Status: implementation-ready draft  
 Working directory: `/home/hari/projects/git-storage`  
 Language: TypeScript on Node.js  

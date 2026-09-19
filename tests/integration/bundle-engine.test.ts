@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,351 +8,181 @@ import { GitRepositoryEngine } from "../../src/git/git-repository-engine.js";
 import { withGitFixture } from "../support/git-fixture.js";
 
 const directories: string[] = [];
-
 async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "git-storage-bundle-output-"));
   directories.push(directory);
   return directory;
 }
-
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-describe("GitRepositoryEngine", () => {
-  test("creates a complete one-commit bundle and imports its objects without mutating target refs", async () => {
+describe("GitRepositoryEngine incremental artifacts", () => {
+  test("creates a self-contained base artifact", async () => {
     await withGitFixture(async (fixture) => {
-      const commit = await fixture.commit("readme.txt", "one\n", "initial commit");
-      const output = join(await temporaryDirectory(), "repository.bundle");
-      const destination = join(await temporaryDirectory(), "restored.git");
+      const commit = await fixture.commit("readme.txt", "one\n", "initial");
+      const output = join(await temporaryDirectory(), "base.bundle");
+      const target = join(await temporaryDirectory(), "target.git");
       const engine = new GitRepositoryEngine();
 
-      const result = await engine.buildNextBundle({
-        existingBundlePath: null,
+      const result = await engine.buildIncrementalArtifact({
+        currentRefs: {},
+        hasRemoteArtifacts: false,
         localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "refs/heads/main", destination: "refs/heads/main", force: false }],
+        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
         outputBundlePath: output,
       });
-      await fixture.git(fixture.root, ["init", "--bare", destination]);
-      await engine.importBundle(output, destination);
+      await fixture.git(fixture.root, ["init", "--bare", target]);
+      await engine.importArtifact(output, target);
 
       expect(result.refs).toEqual({ "refs/heads/main": commit });
-      await expect(fixture.git(destination, ["cat-file", "-e", `${commit}^{commit}`])).resolves.toBe("");
-      expect(await fixture.git(destination, ["cat-file", "-t", commit])).toBe("commit");
-      expect(await fixture.git(destination, ["for-each-ref", "--format=%(refname)"])).toBe("");
-      await expect(fixture.git(destination, ["fsck", "--full"])).resolves.toContain("dangling commit");
+      expect(result.artifact).toMatchObject({
+        kind: "base",
+        prerequisites: [],
+        heads: { "refs/heads/main": commit },
+      });
+      expect(await engine.hasObject(target, commit)).toBe(true);
     });
   });
 
-  test("lists the main ref for HEAD advertisement after building a bundle", async () => {
+  test("creates a thin incremental artifact that applies after its base", async () => {
     await withGitFixture(async (fixture) => {
-      const commit = await fixture.commit("readme.txt", "one\n", "initial commit");
-      const output = join(await temporaryDirectory(), "repository.bundle");
+      const first = await fixture.commit("readme.txt", "one\n", "first");
       const engine = new GitRepositoryEngine();
-
-      await engine.buildNextBundle({
-        existingBundlePath: null,
+      const basePath = join(await temporaryDirectory(), "base.bundle");
+      await engine.buildIncrementalArtifact({
+        currentRefs: {}, hasRemoteArtifacts: false, localGitDir: fixture.repository,
+        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
+        outputBundlePath: basePath,
+      });
+      const second = await fixture.commit("readme.txt", "two\n", "second");
+      const incrementalPath = join(await temporaryDirectory(), "incremental.bundle");
+      const incremental = await engine.buildIncrementalArtifact({
+        currentRefs: { "refs/heads/main": first },
+        hasRemoteArtifacts: true,
         localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "refs/heads/main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: output,
+        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
+        outputBundlePath: incrementalPath,
       });
+      const target = join(await temporaryDirectory(), "target.git");
+      await fixture.git(fixture.root, ["init", "--bare", target]);
+      await expect(engine.importArtifact(incrementalPath, target)).rejects.toMatchObject({ code: "REMOTE_BUNDLE_CORRUPT" });
+      await engine.importArtifact(basePath, target);
+      await engine.importArtifact(incrementalPath, target);
 
-      await expect(engine.listRefs(output)).resolves.toEqual({
-        refs: [{ name: "refs/heads/main", objectId: commit }],
+      expect(incremental.artifact).toMatchObject({
+        kind: "incremental",
+        prerequisites: [first],
+        heads: { "refs/heads/main": second },
       });
+      expect(await engine.hasObject(target, second)).toBe(true);
     });
   });
 
-  test("preserves an existing branch while adding another branch", async () => {
+  test("preserves unrelated refs in metadata and emits only changed heads", async () => {
     await withGitFixture(async (fixture) => {
-      const main = await fixture.commit("readme.txt", "one\n", "initial commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const replacementBundle = join(await temporaryDirectory(), "replacement.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "refs/heads/main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
+      const main = await fixture.commit("readme.txt", "one\n", "main");
       await fixture.createBranch("feature", "main");
       await fixture.git(fixture.repository, ["switch", "feature"]);
-      const feature = await fixture.commit("feature.txt", "feature\n", "feature commit");
-
-      const result = await engine.buildNextBundle({
-        existingBundlePath: initialBundle,
+      const feature = await fixture.commit("feature.txt", "feature\n", "feature");
+      const result = await new GitRepositoryEngine().buildIncrementalArtifact({
+        currentRefs: { "refs/heads/main": main },
+        hasRemoteArtifacts: true,
         localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "refs/heads/feature", destination: "refs/heads/feature", force: false }],
-        outputBundlePath: replacementBundle,
+        updates: [{ kind: "update", source: "feature", destination: "refs/heads/feature", force: false }],
+        outputBundlePath: join(await temporaryDirectory(), "feature.bundle"),
       });
-
-      expect(result.refs).toEqual({ "refs/heads/feature": feature, "refs/heads/main": main });
-      await expect(engine.listRefs(replacementBundle)).resolves.toEqual({
-        refs: [
-          { name: "refs/heads/feature", objectId: feature },
-          { name: "refs/heads/main", objectId: main },
-        ],
-      });
+      expect(result.refs).toEqual({ "refs/heads/main": main, "refs/heads/feature": feature });
+      expect(result.artifact?.heads).toEqual({ "refs/heads/feature": feature });
     });
   });
 
-  test("preserves annotated and lightweight tags as their Git object types", async () => {
+  test("rejects non-fast-forward branches and unforced tag replacement", async () => {
     await withGitFixture(async (fixture) => {
-      const commit = await fixture.commit("readme.txt", "one\n", "initial commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const replacementBundle = join(await temporaryDirectory(), "replacement.bundle");
-      const destination = join(await temporaryDirectory(), "restored.git");
+      const base = await fixture.commit("readme.txt", "base\n", "base");
+      const remote = await fixture.commit("readme.txt", "remote\n", "remote");
+      await fixture.git(fixture.repository, ["switch", "-c", "divergent", base]);
+      await fixture.commit("readme.txt", "divergent\n", "divergent");
       const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
-      await fixture.git(fixture.repository, ["tag", "-a", "v1.0.0", "-m", "annotated", "main"]);
-      await fixture.git(fixture.repository, ["tag", "latest", "main"]);
-      const annotatedTag = await fixture.objectId("v1.0.0");
-      const lightweightTag = await fixture.objectId("latest");
-
-      const result = await engine.buildNextBundle({
-        existingBundlePath: initialBundle,
-        localGitDir: fixture.repository,
-        updates: [
-          { kind: "update", source: "v1.0.0", destination: "refs/tags/v1.0.0", force: false },
-          { kind: "update", source: "latest", destination: "refs/tags/latest", force: false },
-        ],
-        outputBundlePath: replacementBundle,
-      });
-      await fixture.git(fixture.root, ["init", "--bare", destination]);
-      await engine.importBundle(replacementBundle, destination);
-
-      expect(result.refs).toEqual({
-        "refs/heads/main": commit,
-        "refs/tags/latest": lightweightTag,
-        "refs/tags/v1.0.0": annotatedTag,
-      });
-      expect(await fixture.git(destination, ["cat-file", "-t", annotatedTag])).toBe("tag");
-      expect(await fixture.git(destination, ["cat-file", "-t", lightweightTag])).toBe("commit");
-      expect(await fixture.git(destination, ["for-each-ref", "--format=%(refname)"])).toBe("");
-      await expect(fixture.git(destination, ["fsck", "--full"])).resolves.toContain("dangling");
-    });
-  });
-
-  test("updates a branch with a fast-forward commit", async () => {
-    await withGitFixture(async (fixture) => {
-      await fixture.commit("readme.txt", "one\n", "initial commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const replacementBundle = join(await temporaryDirectory(), "replacement.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
-      const nextCommit = await fixture.commit("readme.txt", "two\n", "fast-forward commit");
-
-      const result = await engine.buildNextBundle({
-        existingBundlePath: initialBundle,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: replacementBundle,
-      });
-
-      expect(result.refs).toEqual({ "refs/heads/main": nextCommit });
-      await expect(engine.listRefs(replacementBundle)).resolves.toEqual({
-        refs: [{ name: "refs/heads/main", objectId: nextCommit }],
-      });
-    });
-  });
-
-  test("rejects a non-fast-forward branch update unless force is explicit", async () => {
-    await withGitFixture(async (fixture) => {
-      const initial = await fixture.commit("readme.txt", "one\n", "initial commit");
-      await fixture.commit("readme.txt", "remote\n", "remote commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const rejectedBundle = join(await temporaryDirectory(), "rejected.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
-      await fixture.git(fixture.repository, ["switch", "-c", "divergent", initial]);
-      await fixture.commit("readme.txt", "other\n", "divergent commit");
-
-      await expect(engine.buildNextBundle({
-        existingBundlePath: initialBundle,
+      await expect(engine.buildIncrementalArtifact({
+        currentRefs: { "refs/heads/main": remote }, hasRemoteArtifacts: true,
         localGitDir: fixture.repository,
         updates: [{ kind: "update", source: "divergent", destination: "refs/heads/main", force: false }],
-        outputBundlePath: rejectedBundle,
+        outputBundlePath: join(await temporaryDirectory(), "rejected.bundle"),
+      })).rejects.toMatchObject({ code: "NON_FAST_FORWARD" });
+
+      await fixture.git(fixture.repository, ["tag", "old", base]);
+      await fixture.git(fixture.repository, ["tag", "new", "divergent"]);
+      const oldTag = await fixture.objectId("old");
+      await expect(engine.buildIncrementalArtifact({
+        currentRefs: { "refs/tags/release": oldTag }, hasRemoteArtifacts: true,
+        localGitDir: fixture.repository,
+        updates: [{ kind: "update", source: "new", destination: "refs/tags/release", force: false }],
+        outputBundlePath: join(await temporaryDirectory(), "tag.bundle"),
       })).rejects.toMatchObject({ code: "NON_FAST_FORWARD" });
     });
   });
 
-  test("accepts the same non-fast-forward branch update when force is explicit", async () => {
+  test("allows explicit force and creates a self-contained incremental when the old tip is unrelated", async () => {
     await withGitFixture(async (fixture) => {
-      const initial = await fixture.commit("readme.txt", "one\n", "initial commit");
-      await fixture.commit("readme.txt", "remote\n", "remote commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const replacementBundle = join(await temporaryDirectory(), "replacement.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
-      await fixture.git(fixture.repository, ["switch", "-c", "divergent", initial]);
-      const divergent = await fixture.commit("readme.txt", "other\n", "divergent commit");
-
-      const result = await engine.buildNextBundle({
-        existingBundlePath: initialBundle,
+      const base = await fixture.commit("readme.txt", "base\n", "base");
+      const remote = await fixture.commit("readme.txt", "remote\n", "remote");
+      await fixture.git(fixture.repository, ["switch", "-c", "divergent", base]);
+      const divergent = await fixture.commit("readme.txt", "divergent\n", "divergent");
+      const result = await new GitRepositoryEngine().buildIncrementalArtifact({
+        currentRefs: { "refs/heads/main": remote }, hasRemoteArtifacts: true,
         localGitDir: fixture.repository,
         updates: [{ kind: "update", source: "divergent", destination: "refs/heads/main", force: true }],
-        outputBundlePath: replacementBundle,
+        outputBundlePath: join(await temporaryDirectory(), "forced.bundle"),
       });
-
       expect(result.refs).toEqual({ "refs/heads/main": divergent });
+      expect(result.artifact?.prerequisites).toEqual([]);
     });
   });
 
-  test("deletes a branch while preserving unrelated refs", async () => {
+  test("deletions change refs without creating an artifact", async () => {
     await withGitFixture(async (fixture) => {
-      const main = await fixture.commit("readme.txt", "one\n", "initial commit");
-      await fixture.createBranch("obsolete", "main");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const replacementBundle = join(await temporaryDirectory(), "replacement.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [
-          { kind: "update", source: "main", destination: "refs/heads/main", force: false },
-          { kind: "update", source: "obsolete", destination: "refs/heads/obsolete", force: false },
-        ],
-        outputBundlePath: initialBundle,
-      });
-
-      const result = await engine.buildNextBundle({
-        existingBundlePath: initialBundle,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "delete", source: null, destination: "refs/heads/obsolete", force: false }],
-        outputBundlePath: replacementBundle,
-      });
-
-      expect(result.refs).toEqual({ "refs/heads/main": main });
-    });
-  });
-
-  test("returns an explicit empty result after deleting the final ref", async () => {
-    await withGitFixture(async (fixture) => {
-      await fixture.commit("readme.txt", "one\n", "initial commit");
-      const initialBundle = join(await temporaryDirectory(), "initial.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: initialBundle,
-      });
-
-      await expect(engine.buildNextBundle({
-        existingBundlePath: initialBundle,
+      const main = await fixture.commit("readme.txt", "one\n", "main");
+      const result = await new GitRepositoryEngine().buildIncrementalArtifact({
+        currentRefs: { "refs/heads/main": main }, hasRemoteArtifacts: true,
         localGitDir: fixture.repository,
         updates: [{ kind: "delete", source: null, destination: "refs/heads/main", force: false }],
         outputBundlePath: join(await temporaryDirectory(), "unused.bundle"),
-      })).resolves.toEqual({ bundlePath: null, bundleSha256: null, refs: {} });
-    });
-  });
-
-  test("rejects a tree proposed as a branch target without replacing an existing output", async () => {
-    await withGitFixture(async (fixture) => {
-      await fixture.commit("readme.txt", "one\n", "initial commit");
-      const output = join(await temporaryDirectory(), "repository.bundle");
-      const engine = new GitRepositoryEngine();
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: output,
       });
-      const before = await readFile(output);
-      const tree = await fixture.git(fixture.repository, ["write-tree"]);
-
-      await expect(engine.buildNextBundle({
-        existingBundlePath: output,
-        localGitDir: fixture.repository,
-        updates: [{ kind: "update", source: tree, destination: "refs/heads/main", force: false }],
-        outputBundlePath: output,
-      })).rejects.toMatchObject({ code: "INVALID_REF" });
-      expect(await readFile(output)).toEqual(before);
+      expect(result).toEqual({ artifact: null, refs: {} });
     });
   });
 
-  test("rejects blob and tag objects proposed as branch targets", async () => {
+  test("rejects non-commit branch targets and corrupt artifacts", async () => {
     await withGitFixture(async (fixture) => {
-      await fixture.commit("readme.txt", "one\n", "initial commit");
-      await fixture.git(fixture.repository, ["tag", "-a", "v1.0.0", "-m", "annotated", "main"]);
+      await fixture.commit("readme.txt", "one\n", "main");
       const blob = await fixture.git(fixture.repository, ["hash-object", "-w", "readme.txt"]);
-      const output = join(await temporaryDirectory(), "repository.bundle");
-      const engine = new GitRepositoryEngine();
+      await expect(new GitRepositoryEngine().buildIncrementalArtifact({
+        currentRefs: {}, hasRemoteArtifacts: false, localGitDir: fixture.repository,
+        updates: [{ kind: "update", source: blob, destination: "refs/heads/main", force: false }],
+        outputBundlePath: join(await temporaryDirectory(), "invalid.bundle"),
+      })).rejects.toMatchObject({ code: "INVALID_REF" });
 
-      for (const source of [blob, "v1.0.0"]) {
-        await expect(engine.buildNextBundle({
-          existingBundlePath: null,
-          localGitDir: fixture.repository,
-          updates: [{ kind: "update", source, destination: "refs/heads/main", force: false }],
-          outputBundlePath: output,
-        })).rejects.toMatchObject({ code: "INVALID_REF" });
-      }
+      const corrupt = join(await temporaryDirectory(), "corrupt.bundle");
+      const target = join(await temporaryDirectory(), "target.git");
+      await writeFile(corrupt, "not a bundle");
+      await fixture.git(fixture.root, ["init", "--bare", target]);
+      await expect(new GitRepositoryEngine().importArtifact(corrupt, target))
+        .rejects.toMatchObject({ code: "REMOTE_BUNDLE_CORRUPT" });
     });
   });
 
-  test("rejects a corrupt bundle with the stable corruption error", async () => {
-    const corruptBundle = join(await temporaryDirectory(), "corrupt.bundle");
-    await writeFile(corruptBundle, "not a Git bundle");
-    await expect(new GitRepositoryEngine().verifyBundle(corruptBundle)).rejects.toMatchObject({
-      code: "REMOTE_BUNDLE_CORRUPT",
-    });
-  });
-
-  test("rejects a disconnected incremental bundle with the stable corruption error", async () => {
+  test("cleans temporary repositories", async () => {
     await withGitFixture(async (fixture) => {
-      const prerequisite = await fixture.commit("readme.txt", "one\n", "initial commit");
-      await fixture.commit("readme.txt", "two\n", "incremental commit");
-      const disconnectedBundle = join(await temporaryDirectory(), "incremental.bundle");
-      await fixture.git(fixture.repository, ["bundle", "create", disconnectedBundle, "main", `^${prerequisite}`]);
-
-      await expect(new GitRepositoryEngine().verifyBundle(disconnectedBundle)).rejects.toMatchObject({
-        code: "REMOTE_BUNDLE_CORRUPT",
-      });
-    });
-  });
-
-  test("cleans its owned temporary bare repositories after success and failure", async () => {
-    await withGitFixture(async (fixture) => {
-      await fixture.commit("readme.txt", "one\n", "initial commit");
-      const temporaryParent = await temporaryDirectory();
-      const output = join(await temporaryDirectory(), "repository.bundle");
-      const engine = new GitRepositoryEngine();
-
-      await engine.buildNextBundle({
-        existingBundlePath: null,
-        localGitDir: fixture.repository,
+      await fixture.commit("readme.txt", "one\n", "main");
+      const parent = await temporaryDirectory();
+      await new GitRepositoryEngine().buildIncrementalArtifact({
+        currentRefs: {}, hasRemoteArtifacts: false, localGitDir: fixture.repository,
         updates: [{ kind: "update", source: "main", destination: "refs/heads/main", force: false }],
-        outputBundlePath: output,
-        temporaryDirectoryParent: temporaryParent,
+        outputBundlePath: join(await temporaryDirectory(), "base.bundle"),
+        temporaryDirectoryParent: parent,
       });
-      await expect(engine.buildNextBundle({
-        existingBundlePath: join(temporaryParent, "missing.bundle"),
-        localGitDir: fixture.repository,
-        updates: [],
-        outputBundlePath: output,
-        temporaryDirectoryParent: temporaryParent,
-      })).rejects.toMatchObject({ code: "REMOTE_BUNDLE_CORRUPT" });
-      await expect(readdir(temporaryParent)).resolves.toEqual([]);
+      expect(await readdir(parent)).toEqual([]);
     });
   });
 });
